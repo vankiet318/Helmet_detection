@@ -12,6 +12,5 @@
 
 ```
 pip install numpy pillow torch torchvision opencv pillow numpy streamlit ultralytics
+streamlit run app.py
 ```
-
-Sau khi chạy các lệnh trên, chuyển terminal vào thư mục chứa `app.py` và chạy `streamlit run app.py`.
