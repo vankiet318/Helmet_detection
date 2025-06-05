@@ -3,95 +3,127 @@ import streamlit as st
 from PIL import Image
 import cv2
 from ultralytics import YOLO
-import subprocess
 import torch
 import time
+from collections import defaultdict, deque
 
-# Load the YOLO model
-model = YOLO("best.pt")  # Replace with the path to your trained model
+from sort import Sort  # Make sure sort.py is in the same folder
+
+# Load YOLO model
+model = YOLO("best.pt")  # Replace with your trained model path
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 model.to(device)
-# Streamlit app
-st.title("Helmet Detection")
 
-# Sidebar for uploading image
-st.sidebar.header("Control")
-video_data = st.sidebar.file_uploader("Upload file", ['mp4','mov', 'avi'])
-temp_file_to_save = './save.mp4'
-temp_file_result  = './result.mp4'
+# Streamlit UI
+st.title("Helmet Detection with Tracking")
+
+# Sidebar
+st.sidebar.header("Upload Video")
+video_data = st.sidebar.file_uploader("Upload video", ['mp4','mov', 'avi'])
 run_button = st.sidebar.button("Process")
 
-frame_times = []
+# Temp file paths
+input_path = './save.mp4'
+output_path = './result.mp4'
 
+# Write file helper
 def write_bytesio_to_file(filename, bytesio):
-    """
-    Write the contents of the given BytesIO to a file.
-    Creates the file or overwrites the file if it does
-    not exist yet. 
-    """
-    with open(filename, "wb") as outfile:
-        outfile.write(bytesio.getbuffer())
+    with open(filename, "wb") as f:
+        f.write(bytesio.getbuffer())
 
-if video_data:
-    if run_button:
-        # save uploaded video to disc
-        write_bytesio_to_file(temp_file_to_save, video_data)
+# Smoothing memory
+label_memory = defaultdict(lambda: deque(maxlen=5))  # Store last 5 labels per ID
+track_labels = {}  # Final label per ID
 
-        cap = cv2.VideoCapture(temp_file_to_save)
+if video_data and run_button:
+    # Save uploaded video
+    write_bytesio_to_file(input_path, video_data)
 
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        frame_fps = cap.get(cv2.CAP_PROP_FPS)
-        st.write(width, height, frame_fps)
-        
-        fourcc_mp4 = cv2.VideoWriter_fourcc(*'XVID')
-        out_mp4 = cv2.VideoWriter(temp_file_result, fourcc_mp4, frame_fps, (width, height),isColor = True)
-    
-        video_start = time.time()
+    cap = cv2.VideoCapture(input_path)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frame_fps = cap.get(cv2.CAP_PROP_FPS)
 
-        while True:
-            ret,frame = cap.read()
-            if not ret: break
+    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+    out = cv2.VideoWriter(output_path, fourcc, frame_fps, (width, height))
 
-            frame_start = time.time()
+    st.write(f"Resolution: {width}x{height}, FPS: {frame_fps}")
 
-            # Detect and process frame
-            with torch.no_grad():
-                output = model(frame)
-                        
-            for box in output[0].boxes:
-                x, y, x2, y2 = map(int,box.xyxy[0])
+    tracker = Sort()
+    frame_times = []
+    start_video = time.time()
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_start = time.time()
+        detections = []
+
+        with torch.no_grad():
+            results = model(frame)
+
+        boxes = results[0].boxes
+        if boxes:
+            for box in boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
                 conf = box.conf[0].item()
                 cls = int(box.cls[0])
+
                 if conf > 0.5:
-                    label = f"{model.names[cls]}"  # Label text
-                    color = (0, 0, 255) if cls == 0 else (0, 255, 0)  # Red for class 0, Green otherwise
-                    cv2.rectangle(frame, (x, y), (x2, y2), color, 2)
-                    cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-            out_mp4.write(frame)
+                    detections.append([x1, y1, x2, y2, conf])
 
-            frame_end = time.time()
+        detections = np.array(detections) if len(detections) > 0 else np.empty((0, 5))
+        tracks = tracker.update(detections)
 
-            frame_times.append(frame_end - frame_start)
-        
-        video_end = time.time()
+        for i, track in enumerate(tracks):
+            x1, y1, x2, y2, track_id = map(int, track)
 
-        video_time = video_end - video_start
+            # Find matching detection class by proximity
+            matched_cls = None
+            for box in boxes:
+                bx1, by1, bx2, by2 = map(int, box.xyxy[0])
+                iou = (min(x2, bx2) - max(x1, bx1)) * (min(y2, by2) - max(y1, by1))
+                if iou > 0:
+                    matched_cls = int(box.cls[0])
+                    break
 
-        ## Close video files
-        out_mp4.release()
-        cap.release()
-        
-        ## Show results
-        st.header("Original Video")
-        st.video(temp_file_to_save)
-        st.header("Output")
-        st.video(temp_file_result)
+            if matched_cls is not None:
+                label = model.names[matched_cls]
+                label_memory[track_id].append(label)
 
-        mean_frame_time = np.mean(frame_times)
+                # Smooth label
+                common_label = max(set(label_memory[track_id]), key=label_memory[track_id].count)
+                track_labels[track_id] = common_label
 
-        st.write(f"Total video processing time: {video_time:.4f} seconds")
-        st.write(f"Average frame processing time: {mean_frame_time:.4f} seconds")
-        
+                # Draw
+                if common_label == "helmet" or common_label == 'helmets':
+                    color = (0, 255, 0)
+                elif common_label == "non_helmet" or common_label == 'non_helmets':
+                    color = (0, 0, 255)
+                else:
+                    color = (0, 255, 255)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(frame, f"{common_label} ID:{track_id}", (x1, y1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+        out.write(frame)
+        frame_times.append(time.time() - frame_start)
+
+    cap.release()
+    out.release()
+
+    total_time = time.time() - start_video
+    avg_time = np.mean(frame_times)
+
+    # Display results
+    st.header("Original Video")
+    st.video(input_path)
+    st.header("Processed Video")
+    st.video(output_path)
+    st.write(f"Total processing time: {total_time:.2f}s")
+    st.write(f"Average frame time: {avg_time:.4f}s")
+
 else:
-    st.write("Upload a video to get started.")
+    st.write("Upload a video and press Process to start.")
